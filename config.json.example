@@ -1,0 +1,19 @@
+{
+    "emby_server": "http://EMBY_IP:8096",
+    "user_name": "EMBY_USER",
+    "user_password": "EMBY_PASSWORD",
+    "Oppo_IP": "OPPO_IP",
+    "smb_user": "SMB_USER",
+    "smb_password": "SMB_PASSWORD",
+    "timeout_oppo_conection": 10,
+    "timeout_oppo_playitem": 60,
+    "timeout_oppo_mount": 60,
+    "smbtrick": false,
+    "Autoscript": false,
+    "Always_ON": true,
+    "enable_all_libraries": true,
+    "Libraries": [],
+    "servers": [],
+    "MonitoredDevice": "",
+    "DebugLevel": 1
+}

@@ -1,0 +1,13 @@
+.git
+.gitignore
+.bak
+web/
+versions/
+*.pyc
+__pycache__
+*.log
+config.json
+stdout.log
+.dockerignore
+Dockerfile
+.github/

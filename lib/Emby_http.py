@@ -408,7 +408,7 @@ class EmbyHttp(threading.Thread):
         response_data_item = self.get_ulr_data(url2, self.config, self.user_info)
         item_list_data = json.loads(response_data_item)
         logging.debug('Item List Data %s',item_list_data)
-        for mediasource in item_list_data["MediaSources"]:
+        for mediasource in item_list_data.get("MediaSources", []):
             if mediasource["Id"]==mediasource_id:
                 return(mediasource)
         return item_list_data
