@@ -9,6 +9,12 @@ for v in EMBY_SERVER EMBY_USER EMBY_PASSWORD OPPO_IP; do
   fi
 done
 
+# Be forgiving if the user omits the scheme on the Emby URL (e.g. "host:8096").
+case "$EMBY_SERVER" in
+  http://*|https://*) ;;
+  *) EMBY_SERVER="http://${EMBY_SERVER}" ;;
+esac
+
 # ─── Helper: parse boolean ──────────────────────────────────────────
 parse_bool() {
   case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
