@@ -49,7 +49,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -574,12 +574,16 @@ class _FileHandler(BaseHTTPRequestHandler):
             return
         start, end = rng if rng else (0, e.size - 1)
         upstream = discard = None
+        t_open = time.time()
         if body and e.data is None:
             try:
                 upstream, discard = self.server.upstream.open(e, start, end)
             except CastError as ex:
                 log.warning("read %s/%s [%d-%d]: %s", parts[0], e.name, start, end, ex)
+                self.server.reads.append({"t": round(t_open, 3), "file": e.name, "start": start,
+                                          "len": end - start + 1, "error": str(ex)})
                 return self._plain(502, str(ex))
+        t_hdr = time.time()
         self.send_response(206 if rng else 200)
         self.send_header("Content-Type", e.mime)
         self.send_header("Content-Length", str(end - start + 1))
@@ -593,9 +597,16 @@ class _FileHandler(BaseHTTPRequestHandler):
         if e.data is not None:
             self.wfile.write(e.data[start:end + 1])
             return
-        self._pump(upstream, discard, end - start + 1, e.name)
+        sent = self._pump(upstream, discard, end - start + 1, e.name)
+        # rclone's upstream fetches: what the OPPO's reads cost on usenet (GET /debug/reads)
+        self.server.reads.append({"t": round(t_open, 3), "file": e.name, "start": start,
+                                  "len": end - start + 1, "sent": sent,
+                                  "ttfb_ms": int((t_hdr - t_open) * 1000),
+                                  "ms": int((time.time() - t_open) * 1000)})
 
     def _pump(self, r, discard, remaining, name):
+        """Stream the upstream body to the client; -> bytes actually sent."""
+        sent, aborted = 0, False
         try:
             for chunk in r.iter_content(CHUNK):
                 if discard:
@@ -603,22 +614,23 @@ class _FileHandler(BaseHTTPRequestHandler):
                         discard -= len(chunk)
                         continue
                     chunk, discard = chunk[discard:], 0
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
+                if len(chunk) > remaining - sent:
+                    chunk = chunk[:remaining - sent]
                 self.wfile.write(chunk)
-                remaining -= len(chunk)
-                if remaining <= 0:
+                sent += len(chunk)
+                if sent >= remaining:
                     break
         except (BrokenPipeError, ConnectionResetError):
-            remaining = 0  # reader went away (seek / close): normal
+            aborted = True  # reader went away (rclone seek / close): normal
             self.close_connection = True
         except (requests.RequestException, OSError) as ex:
             log.warning("upstream stream for %s broke: %s", name, ex)
         finally:
             r.close()
-        if remaining > 0:
-            log.warning("short upstream read for %s (%d bytes missing)", name, remaining)
+        if sent < remaining and not aborted:
+            log.warning("short upstream read for %s (%d bytes missing)", name, remaining - sent)
             self.close_connection = True
+        return sent
 
 
 class _Server(ThreadingHTTPServer):
@@ -765,6 +777,7 @@ class CastService:
         self.catalog = Catalog(self.cfg.keep)
         self.upstream = Upstream()
         self.rclone = RcloneMount(self.cfg)
+        self.reads = deque(maxlen=int(_env("CAST_READ_LOG", "2000")))
         self.mount_problem = None
         self._lock = threading.Lock()
         self._oppo_lock = threading.Lock()   # one cast talks to the OPPO at a time
@@ -775,7 +788,7 @@ class CastService:
     def start(self):
         log.info("cast: %s", self.cfg.summary())
         fs = _Server(("127.0.0.1", self.cfg.files_port), _FileHandler)
-        fs.catalog, fs.upstream = self.catalog, self.upstream
+        fs.catalog, fs.upstream, fs.reads = self.catalog, self.upstream, self.reads
         threading.Thread(target=fs.serve_forever, name="cast-files", daemon=True).start()
         if self.cfg.manage_rclone:
             self.mount_problem = self.rclone.available()
@@ -1050,7 +1063,10 @@ class CastService:
         size = prep["size"]
         if not os.path.isfile(path) or not size:
             return
-        head = min(size, int(_env("CAST_PREWARM_HEAD_MB", "8")) << 20)
+        # Blu-ray ISOs have no single index: the UDF structures and the small BDMV files
+        # (index.bdmv, MovieObject, PLAYLIST/CLIPINF) normally sit near the start
+        head_mb = _env("CAST_PREWARM_ISO_HEAD_MB", "64") if prep["ext"] == "iso" else _env("CAST_PREWARM_HEAD_MB", "8")
+        head = min(size, int(head_mb) << 20)
         cap = int(_env("CAST_PREWARM_INDEX_MB", "96")) << 20
         index = None
         try:
@@ -1243,6 +1259,18 @@ class _ApiHandler(BaseHTTPRequestHandler):
             return self._send(401, {"ok": False, "error": "bad token"})
         if path in ("/", "/status"):
             return self._send(200, self.server.svc.status())
+        if path == "/debug/reads":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            since = float(q.get("since", ["0"])[0])
+            return self._send(200, [r for r in list(self.server.svc.reads) if r["t"] > since])
+        if path == "/debug/rclone":
+            out = {}
+            for call in ("vfs/stats", "core/stats"):
+                try:
+                    out[call] = requests.post(f"http://{self.server.svc.cfg.rc_addr}/{call}", timeout=5).json()
+                except (requests.RequestException, ValueError) as ex:
+                    out[call] = {"error": str(ex)}
+            return self._send(200, out)
         self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):

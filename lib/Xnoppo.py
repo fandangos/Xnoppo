@@ -11,6 +11,7 @@ import time
 import telnetlib
 import threading
 import logging
+import re
 from .Emby_http import EmbyHttp
 
 
@@ -73,10 +74,58 @@ def getsetupmenu(config):
     #if config["DebugLevel"]>0: print (response.text)
     return response.text
 
+
+def local_ip_towards(ip):
+    """Our LAN address as seen from the OPPO (it pushes status to the app's address)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((ip, 9))
+        addr = s.getsockname()[0]
+        s.close()
+        return addr
+    except OSError:
+        return "127.0.0.1"
+
+
+def ensure_smb_discovery(config, server, timeout=25):
+    """Make the OPPO able to log in to `server` on the FIRST play.
+
+    The OPPO only logs in to SMB servers its media center has discovered, and the
+    network search only runs when /getdevicelist is called; ~5-10 s later the server
+    shows up as a "cifs" device. With an empty list the login fails instantly - which
+    is why a play used to need a second press. The OPPO's screensaver also pauses the
+    media center (activeapp "scrn_svr"); one Return key press resumes it.
+    (Found with the OPPO console log, 2026-11-01; see lib/cast.py for the same logic.)"""
+    base = "http://" + config["Oppo_IP"] + ":436"
+    try:
+        g = requests.get(base + "/getglobalinfo", timeout=5).json()
+        if g.get("activeapp") == "scrn_svr":
+            logging.info("OPPO screensaver up: pressing Return to resume the media center")
+            requests.get(base + '/sendremotekey?{"key":"RET"}', timeout=5)
+            time.sleep(1.5)
+    except (requests.RequestException, ValueError):
+        pass
+    want = str(server).upper()
+    is_ip = re.fullmatch(r"[0-9.]+", str(server)) is not None
+    deadline = time.time() + timeout
+    names = []
+    while time.time() < deadline:
+        try:
+            d = requests.get(base + "/getdevicelist", timeout=8).json()
+            names = [str(e.get("name", "")) for e in d.get("devicelist") or [] if e.get("sub_type") == "cifs"]
+            if want in (n.upper() for n in names) or (is_ip and names):
+                logging.info("OPPO sees SMB servers %s", names)
+                return True
+        except (requests.RequestException, ValueError):
+            pass
+        time.sleep(2)
+    logging.warning("OPPO network search never listed %s (saw %s)", server, names)
+    return False
+
 def OppoSignin(config):
     #if config["DebugLevel"]>0: print("OppoSignin\n")
     #url = "http://" + config["Oppo_IP"] + ":436/signin?%7B%22appIconType%22%3A1%2C%22appIpAddress%22%3A%22" + config["emby_server"] + "%22%7D"
-    url = "http://" + config["Oppo_IP"] + ":436/signin?%7B%22appIconType%22%3A1%2C%22appIpAddress%22%3A%22" + '192.168.1.135' + "%22%7D"
+    url = "http://" + config["Oppo_IP"] + ":436/signin?%7B%22appIconType%22%3A1%2C%22appIpAddress%22%3A%22" + local_ip_towards(config["Oppo_IP"]) + "%22%7D"
     headers = {}
     #if config["DebugLevel"]>0: print (url)
     #if config["DebugLevel"]>0: print("\n")
@@ -430,6 +479,7 @@ def playother(EmbySession,data,scripterx=False):
     EmbySession.folder = carpeta
     EmbySession.filename = fichero
     EmbySession.playedtitle = ItemInfo["Name"]
+    ensure_smb_discovery(EmbySession.config, servidor)
     response_login = LoginSambaWithOutID(EmbySession.config,servidor)
     smb_user = EmbySession.config.get("smb_user", "")
     smb_password = EmbySession.config.get("smb_password", "")
@@ -584,6 +634,7 @@ def playto_file(EmbySession,data,scripterx=False):
         EmbySession.filename = fichero
         EmbySession.playedtitle = ItemInfo["Name"]
 
+        ensure_smb_discovery(EmbySession.config, servidor)
         response_login = LoginSambaWithOutID(EmbySession.config,servidor)
         response_share = getSambaShareFolderlist(EmbySession.config)
         # Test
