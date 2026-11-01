@@ -642,6 +642,27 @@ class RcloneMount:
             log.debug("rclone rc refresh failed: %s", e)
 
 
+# ─── OPPO :436 calls with timeouts ───────────────────────────────────────────
+# lib/Xnoppo.py's helpers build the same URLs but some have no timeout at all,
+# and the OPPO's SMB handlers can block indefinitely - a cast must never hang.
+
+def oppo_call(x, endpoint, payload=None, timeout=10):
+    """GET http://OPPO:436/<endpoint>?<json> -> dict ({"timeout": True} / {"error": ...})."""
+    url = f"http://{x['Oppo_IP']}:436/{endpoint}"
+    if payload is not None:
+        url += "?" + urllib.parse.quote(json.dumps(payload, separators=(",", ":")), safe='{}:,"/')
+    try:
+        return _json(requests.get(url, timeout=timeout).text)
+    except requests.Timeout:
+        return {"success": False, "timeout": True, "retInfo": f"no answer in {timeout}s"}
+    except requests.RequestException as e:
+        return {"success": False, "error": str(e), "retInfo": str(e)}
+
+
+def oppo_activeapp(x):
+    return oppo_call(x, "getglobalinfo", timeout=5).get("activeapp", "?")
+
+
 # ─── the service ─────────────────────────────────────────────────────────────
 
 class CastService:
@@ -824,12 +845,21 @@ class CastService:
                 if not self._set(gen, stage=f"mounting (attempt {attempt}/{attempts})"):
                     return None
                 time.sleep(3)
-            X.LoginSambaWithOutID(x, c.smb_server)
-            if c.smb_user:
-                resp = X.mountSharedFolderID(c.smb_server, c.smb_share, c.smb_user, c.smb_password, xq)
+            login_timeout = int(_env("CAST_LOGIN_TIMEOUT", "25"))
+            if c.smb_user and _env("CAST_SMB_LOGIN", "id").lower() == "id":
+                # firmware JSON keys (bdpprog strings): serverName/userName/"psssword" (sic)
+                lg = oppo_call(x, "loginSambaWithID", {"serverName": c.smb_server, "userName": c.smb_user,
+                                                       "psssword": c.smb_password, "bRememberID": 1},
+                               timeout=login_timeout)
             else:
-                resp = X.mountSharedFolder(c.smb_server, c.smb_share, "", "", xq, checksmb=False)
-            m = _json(resp)
+                lg = oppo_call(x, "loginSambaWithOutID", {"serverName": c.smb_server}, timeout=login_timeout)
+            log.info("OPPO login (attempt %d, activeapp=%s): %s", attempt, oppo_activeapp(x),
+                     {k: lg.get(k) for k in ("success", "retInfo", "timeout") if k in lg})
+            folder_payload = {"server": c.smb_server, "bWithID": 1 if c.smb_user else 0,
+                              "folder": c.smb_share, "userName": c.smb_user or "",
+                              "password": c.smb_password or "", "bRememberID": 1 if c.smb_user else 0}
+            m = oppo_call(x, "mountSharedFolder", folder_payload, timeout=xq["timeout_oppo_mount"])
+            resp = json.dumps(m)
             if m.get("success"):
                 log.info("OPPO mounted \\\\%s\\%s (attempt %d)", c.smb_server, c.smb_share, attempt)
                 return "mounted"
@@ -849,12 +879,14 @@ class CastService:
     def _play_and_wait(self, gen, path):
         """-> True playing | False didn't start | None superseded."""
         x, c = self.cfg.x, self.cfg
-        p = _json(X.playnormalfile(c.smb_server, path, "0", x))
+        p = oppo_call(x, "playnormalfile", {"path": f"/mnt/cifs1/{path}", "index": 0, "type": 1,
+                                            "appDeviceType": 2, "extraNetPath": c.smb_server,
+                                            "playMode": 0}, timeout=x.get("timeout_oppo_playitem", 60))
         if not p.get("success"):
             log.info("playnormalfile %s refused: %s", path, p)
             return False
         deadline = time.time() + x.get("timeout_oppo_playitem", 60)
-        while '"is_video_playing":true' not in X.getglobalinfo(x):
+        while not oppo_call(x, "getglobalinfo", timeout=5).get("is_video_playing"):
             if time.time() > deadline:
                 log.info("OPPO accepted %s but never started playing", path)
                 return False
