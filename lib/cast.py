@@ -711,6 +711,7 @@ class CastService:
                 return
             self.wait_visible(prep)
             if req.get("dry_run"):
+                self.prewarm(gen, prep)
                 self._set(gen, stage="ready", note="dry run: files published, OPPO not touched")
                 return
             self.play(gen, prep, float(req.get("position_ms") or 0) / 1000.0)
@@ -804,14 +805,16 @@ class CastService:
             raise CastError("OPPO not reachable (powered off without network standby?)")
         X.OppoSignin(x)
 
-    def _mount(self, gen):
+    def _mount(self, gen, accept_existing=True):
         """Mount the share ROOT on the OPPO (each cast lives in <share>/<id>/).
+        -> "mounted" | "existing" | None (superseded by a newer cast).
 
         The OPPO's first SMB connection to a server is slow: the :436 call answers
         "failed" or times out while the session is still being set up, and a later
         attempt then succeeds at once - the "press play twice" every Xnoppo/Emby user
-        knows. So retry instead of failing. Mounting the root (not <id>) means later
-        casts reuse the live session instead of stacking a new mount per cast."""
+        knows. So retry instead of failing. Mounting the root (not <id>) lets later
+        casts reuse the live mount. The OPPO answers "id_error" when the share is
+        ALREADY mounted: that's "existing" - just play from it."""
         x, c = self.cfg.x, self.cfg
         xq = dict(x, timeout_oppo_mount=int(_env("CAST_MOUNT_TIMEOUT", "20")))
         attempts = int(_env("CAST_MOUNT_ATTEMPTS", "5"))
@@ -819,7 +822,7 @@ class CastService:
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 if not self._set(gen, stage=f"mounting (attempt {attempt}/{attempts})"):
-                    return False
+                    return None
                 time.sleep(3)
             X.LoginSambaWithOutID(x, c.smb_server)
             if c.smb_user:
@@ -829,35 +832,136 @@ class CastService:
             m = _json(resp)
             if m.get("success"):
                 log.info("OPPO mounted \\\\%s\\%s (attempt %d)", c.smb_server, c.smb_share, attempt)
-                return True
+                return "mounted"
             last = m.get("retInfo") or m.get("msg") or str(resp)[:200]
+            if last == "id_error" and accept_existing:
+                log.info("OPPO: id_error = share already mounted; playing from the existing mount")
+                return "existing"
             log.info("OPPO mount attempt %d/%d failed: %s", attempt, attempts, last)
         raise CastError(f"OPPO couldn't mount \\\\{c.smb_server}\\{c.smb_share} "
                         f"after {attempts} attempts: {last}")
 
+    def _unmount_oppo(self):
+        """Clear /mnt/cifs1 on the OPPO (mounts stack; telnet, as Xnoppo's AUTOSCRIPT)."""
+        for _ in range(3):
+            X.umountSharedFolder(self.cfg.x)
+
+    def _play_and_wait(self, gen, path):
+        """-> True playing | False didn't start | None superseded."""
+        x, c = self.cfg.x, self.cfg
+        p = _json(X.playnormalfile(c.smb_server, path, "0", x))
+        if not p.get("success"):
+            log.info("playnormalfile %s refused: %s", path, p)
+            return False
+        deadline = time.time() + x.get("timeout_oppo_playitem", 60)
+        while '"is_video_playing":true' not in X.getglobalinfo(x):
+            if time.time() > deadline:
+                log.info("OPPO accepted %s but never started playing", path)
+                return False
+            if not self._set(gen):
+                return None
+            time.sleep(1)
+        return True
+
+    def prewarm(self, gen, prep):
+        """Usenet (nzbdav) and debrid pay a big latency for every region nobody has read
+        yet, and the OPPO's open makes far jumps first (MKV: header, then the Cues near
+        the end; MP4: the moov box, at either end). Read head and tail through our own
+        FUSE mount, in parallel, so rclone's VFS cache already holds them."""
+        path = os.path.join(self.cfg.mount, prep["cid"], prep["video"])
+        size = prep["size"]
+        head = min(size, int(_env("CAST_PREWARM_HEAD_MB", "8")) << 20)
+        tail = int(_env("CAST_PREWARM_TAIL_MB", "4")) << 20
+        regions = [(0, head)] + ([(max(head, size - tail), size)] if size > head else [])
+        if not os.path.isfile(path) or not head:
+            return
+
+        def read(start, end):
+            try:
+                with open(path, "rb", buffering=0) as f:
+                    f.seek(start)
+                    left = end - start
+                    while left > 0:
+                        b = f.read(min(1 << 20, left))
+                        if not b:
+                            break
+                        left -= len(b)
+            except OSError as e:
+                log.warning("prewarm read %d-%d failed: %s", start, end, e)
+
+        t0 = time.time()
+        threads = [threading.Thread(target=read, args=r, daemon=True) for r in regions]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(int(_env("CAST_PREWARM_TIMEOUT", "60")))
+        log.info("prewarmed %s (%d region(s)) in %.1fs", prep["video"], len(regions), time.time() - t0)
+
+    def select_external_subtitle(self, prep):
+        """The OPPO loads <name>.srt but leaves subtitles Off. Embedded tracks are listed
+        with a language ("2/4 English"), external files without one ("1/1  "), so turn on
+        the first nameless track. CAST_SUB_AUTO=off disables this."""
+        if not prep["subs"] or _env("CAST_SUB_AUTO", "external").lower() == "off":
+            return
+        base = f"http://{self.cfg.x['Oppo_IP']}:436"
+        for _ in range(5):  # the menu fills in a moment after playback starts
+            time.sleep(1.5)
+            try:
+                lst = _json(requests.get(f"{base}/getsubtitlemenulist", timeout=5).text).get("subtitle_list") or []
+            except requests.RequestException:
+                continue
+            tracks = [t for t in lst if t.get("index", 0) > 0]
+            if not tracks:
+                continue
+            ext = [t for t in tracks if not re.sub(r"^\s*\d+/\d+", "", t.get("name", "")).strip()]
+            log.info("OPPO subtitle menu: %s", [t.get("name") for t in lst])
+            if not ext:
+                log.info("no nameless (external) subtitle track found; leaving the choice to the user")
+                return
+            pick = ext[0]["index"]
+            try:
+                requests.get(f'{base}/setsubttmenulist?{{"cur_index":{int(pick)}}}', timeout=5)
+                log.info("enabled external subtitle (menu index %s)", pick)
+            except requests.RequestException as e:
+                log.warning("couldn't enable subtitle: %s", e)
+            return
+
     def play(self, gen, prep, position_s):
         x, c = self.cfg.x, self.cfg
+        # warm the cache while the OPPO wakes up and mounts (both take seconds)
+        warm = threading.Thread(target=self.prewarm, args=(gen, prep), daemon=True)
+        warm.start()
         self._set(gen, stage="waking OPPO")
         self._oppo_ready()
         X.getglobalinfo(x)
         self._set(gen, stage="mounting", share=f"\\\\{c.smb_server}\\{c.smb_share}\\{prep['cid']}")
-        if not self._mount(gen):
+        how = self._mount(gen)
+        if how is None:
             return
+        if warm.is_alive():
+            self._set(gen, stage="buffering")
+            warm.join(int(_env("CAST_PREWARM_TIMEOUT", "60")))
         self._set(gen, stage="starting playback")
         path = f"{prep['cid']}/{prep['video']}"   # relative to /mnt/cifs1 = share root
-        p = _json(X.playnormalfile(c.smb_server, path, "0", x))
-        if not p.get("success"):
-            raise CastError(f"OPPO refused to play {path}: {p.get('msg') or p}")
-        deadline = time.time() + x.get("timeout_oppo_playitem", 60)
-        while '"is_video_playing":true' not in X.getglobalinfo(x):
-            if time.time() > deadline:
-                raise CastError("timed out waiting for the OPPO to start playing")
-            if not self._set(gen):
+        ok = self._play_and_wait(gen, path)
+        if ok is False and how == "existing":
+            # what was mounted wasn't our share root (or went stale): start clean
+            log.info("existing mount didn't work; unmounting and mounting fresh")
+            X.sendremotekey("STP", x)
+            self._unmount_oppo()
+            self._set(gen, stage="mounting (fresh)")
+            if self._mount(gen, accept_existing=False) is None:
                 return
-            time.sleep(1)
+            self._set(gen, stage="starting playback")
+            ok = self._play_and_wait(gen, path)
+        if ok is None:
+            return
+        if not ok:
+            raise CastError(f"the OPPO didn't start playing {prep['video']} (check the TV for a message)")
         if position_s > 5:
             X.setplaytime(x, position_s * 10_000_000)
         self._set(gen, stage="playing", position=position_s)
+        self.select_external_subtitle(prep)
 
     def monitor(self, gen):
         x = self.cfg.x
