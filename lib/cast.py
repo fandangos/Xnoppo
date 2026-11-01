@@ -824,7 +824,10 @@ class CastService:
         X.sendnotifyremote(x["Oppo_IP"])
         if X.check_socket(x) != 0:
             raise CastError("OPPO not reachable (powered off without network standby?)")
-        X.OppoSignin(x)
+        # The OPPO pushes status to <appIpAddress>:4360 every few seconds; lib/Xnoppo.py's
+        # OppoSignin hard-codes 192.168.1.135, so give it our real LAN address instead.
+        me = detect_lan_ip(x["Oppo_IP"]) or "127.0.0.1"
+        oppo_call(x, "signin", {"appIconType": 1, "appIpAddress": me}, timeout=8)
 
     def _ensure_discovered(self, gen):
         """The OPPO only logs in to SMB servers its media center has DISCOVERED, and the
@@ -905,11 +908,6 @@ class CastService:
         raise CastError(f"OPPO couldn't mount \\\\{c.smb_server}\\{c.smb_share} "
                         f"after {attempts} attempts: {last}")
 
-    def _unmount_oppo(self):
-        """Clear /mnt/cifs1 on the OPPO (mounts stack; telnet, as Xnoppo's AUTOSCRIPT)."""
-        for _ in range(3):
-            X.umountSharedFolder(self.cfg.x)
-
     def _play_and_wait(self, gen, path):
         """-> True playing | False didn't start | None superseded."""
         x, c = self.cfg.x, self.cfg
@@ -956,11 +954,12 @@ class CastService:
                 log.warning("prewarm read %d-%d failed: %s", start, end, e)
 
         t0 = time.time()
+        deadline = t0 + int(_env("CAST_PREWARM_TIMEOUT", "15"))
         threads = [threading.Thread(target=read, args=r, daemon=True) for r in regions]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(int(_env("CAST_PREWARM_TIMEOUT", "60")))
+            t.join(max(0.0, deadline - time.time()))
         log.info("prewarmed %s (%d region(s)) in %.1fs", prep["video"], len(regions), time.time() - t0)
 
     def select_external_subtitle(self, prep):
@@ -1006,24 +1005,17 @@ class CastService:
             return
         if warm.is_alive():
             self._set(gen, stage="buffering")
-            warm.join(int(_env("CAST_PREWARM_TIMEOUT", "60")))
+            warm.join(int(_env("CAST_PREWARM_TIMEOUT", "15")))
         self._set(gen, stage="starting playback")
         path = f"{prep['cid']}/{prep['video']}"   # relative to /mnt/cifs1 = share root
         ok = self._play_and_wait(gen, path)
-        if ok is False and how == "existing":
-            # what was mounted wasn't our share root (or went stale): start clean
-            log.info("existing mount didn't work; unmounting and mounting fresh")
-            X.sendremotekey("STP", x)
-            self._unmount_oppo()
-            self._set(gen, stage="mounting (fresh)")
-            if self._mount(gen, accept_existing=False) is None:
-                return
-            self._set(gen, stage="starting playback")
-            ok = self._play_and_wait(gen, path)
         if ok is None:
             return
         if not ok:
-            raise CastError(f"the OPPO didn't start playing {prep['video']} (check the TV for a message)")
+            # Seen with MKVs: the OPPO accepts the file and then never starts parsing it;
+            # a second play of the same file then blocks. Stop it and report, don't retry.
+            oppo_call(x, "sendremotekey", {"key": "STP"}, timeout=5)
+            raise CastError(f"the OPPO accepted {prep['video']} but never started playing it - if it stays stuck, power-cycle the OPPO")
         if position_s > 5:
             X.setplaytime(x, position_s * 10_000_000)
         self._set(gen, stage="playing", position=position_s)
