@@ -826,6 +826,35 @@ class CastService:
             raise CastError("OPPO not reachable (powered off without network standby?)")
         X.OppoSignin(x)
 
+    def _ensure_discovered(self, gen):
+        """The OPPO only logs in to SMB servers its media center has DISCOVERED, and the
+        network search only runs when /getdevicelist is called (the original Xnoppo
+        test-mount looped on it; Emby's flow calls it 3x, which is why its 2nd press
+        works). The OPPO's screensaver also pauses the media center. So: wake it, then
+        poll getdevicelist until our server is listed as a "cifs" device.
+        Seen on the console: login with an empty list fails in <1ms (login cifs
+        failed:-2, then mount "ID error"); after discovery: "CIFS auth success!"."""
+        x, c = self.cfg.x, self.cfg
+        if oppo_activeapp(x) == "scrn_svr":
+            log.info("OPPO screensaver is up (pauses the media center): pressing Return")
+            oppo_call(x, "sendremotekey", {"key": "RET"}, timeout=5)
+            time.sleep(1.5)
+        want = c.smb_server.upper()
+        is_ip = bool(re.fullmatch(r"[\d.]+", c.smb_server))
+        deadline = time.time() + int(_env("CAST_DISCOVERY_TIMEOUT", "25"))
+        seen = []
+        while time.time() < deadline:
+            d = oppo_call(x, "getdevicelist", timeout=8)
+            seen = [str(e.get("name", "")) for e in d.get("devicelist") or [] if e.get("sub_type") == "cifs"]
+            if want in (n.upper() for n in seen) or (is_ip and seen):
+                log.info("OPPO sees SMB servers %s", seen)
+                return True
+            if not self._set(gen):
+                return None
+            time.sleep(2)
+        log.warning("OPPO network search never listed %s (saw %s); trying anyway", c.smb_server, seen)
+        return False
+
     def _mount(self, gen, accept_existing=True):
         """Mount the share ROOT on the OPPO (each cast lives in <share>/<id>/).
         -> "mounted" | "existing" | None (superseded by a newer cast).
@@ -845,6 +874,9 @@ class CastService:
                 if not self._set(gen, stage=f"mounting (attempt {attempt}/{attempts})"):
                     return None
                 time.sleep(3)
+            if attempt == 1 or last in ("failed", "id_error") or "timeout" in last:
+                if self._ensure_discovered(gen) is None:
+                    return None
             login_timeout = int(_env("CAST_LOGIN_TIMEOUT", "25"))
             if c.smb_user and _env("CAST_SMB_LOGIN", "id").lower() == "id":
                 # firmware JSON keys (bdpprog strings): serverName/userName/"psssword" (sic)
@@ -864,7 +896,9 @@ class CastService:
                 log.info("OPPO mounted \\\\%s\\%s (attempt %d)", c.smb_server, c.smb_share, attempt)
                 return "mounted"
             last = m.get("retInfo") or m.get("msg") or str(resp)[:200]
-            if last == "id_error" and accept_existing:
+            # a failed login also makes the mount answer "ID error" - only a mount refused
+            # AFTER a successful login means "already mounted"
+            if last == "id_error" and accept_existing and lg.get("success"):
                 log.info("OPPO: id_error = share already mounted; playing from the existing mount")
                 return "existing"
             log.info("OPPO mount attempt %d/%d failed: %s", attempt, attempts, last)
@@ -966,7 +1000,7 @@ class CastService:
         self._set(gen, stage="waking OPPO")
         self._oppo_ready()
         X.getglobalinfo(x)
-        self._set(gen, stage="mounting", share=f"\\\\{c.smb_server}\\{c.smb_share}\\{prep['cid']}")
+        self._set(gen, stage="finding the server", share=f"\\\\{c.smb_server}\\{c.smb_share}\\{prep['cid']}")
         how = self._mount(gen)
         if how is None:
             return
