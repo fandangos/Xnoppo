@@ -281,6 +281,100 @@ def to_subtitle(raw):
     return ext, text.replace("\n", "\r\n")
 
 
+# ─── container index location (so prewarm reads what the player parses first) ─
+
+def _read_at(f, off, n):
+    f.seek(off)
+    return f.read(n)
+
+
+def mp4_index_range(f, size):
+    """(start, end) of the 'moov' box: walk top-level boxes by their headers only."""
+    off = 0
+    for _ in range(64):
+        if off + 8 > size:
+            return None
+        h = _read_at(f, off, 16)
+        if len(h) < 8:
+            return None
+        bsize, btype, hdr = int.from_bytes(h[0:4], "big"), h[4:8], 8
+        if bsize == 1:
+            if len(h) < 16:
+                return None
+            bsize, hdr = int.from_bytes(h[8:16], "big"), 16
+        elif bsize == 0:
+            bsize = size - off
+        if bsize < hdr:
+            return None
+        if btype == b"moov":
+            return off, min(size, off + bsize)
+        off += bsize
+    return None
+
+
+def _vint(b, i, keep_marker=False):
+    """EBML variable-size integer at b[i] -> (value, length)."""
+    first, mask, length = b[i], 0x80, 1
+    while length <= 8 and not first & mask:
+        mask >>= 1
+        length += 1
+    if length > 8:
+        raise ValueError("bad EBML vint")
+    val = first if keep_marker else first & (mask - 1)
+    for k in range(1, length):
+        val = (val << 8) | b[i + k]
+    return val, length
+
+
+def mkv_index_range(f, size):
+    """(start, end) of the Cues element, found through the SeekHead in the first 256 KB."""
+    head = _read_at(f, 0, 256 * 1024)
+    try:
+        i = 0
+        _, l = _vint(head, i, True); i += l           # EBML header element
+        esz, l = _vint(head, i); i += l + esz
+        sid, l = _vint(head, i, True); i += l          # Segment
+        if sid != 0x18538067:
+            return None
+        _, l = _vint(head, i); i += l
+        seg_data = j = i
+        while j < len(head) - 16:
+            cid, l1 = _vint(head, j, True)
+            csz, l2 = _vint(head, j + l1)
+            body = j + l1 + l2
+            if cid == 0x1F43B675:                       # Cluster: past the metadata
+                return None
+            if cid == 0x114D9B74:                       # SeekHead
+                k = body
+                while k < min(body + csz, len(head) - 8):
+                    eid, a = _vint(head, k, True)
+                    esz2, b2 = _vint(head, k + a)
+                    m, target, pos = k + a + b2, None, None
+                    while eid == 0x4DBB and m < k + a + b2 + esz2:   # Seek
+                        xid, c = _vint(head, m, True)
+                        xsz, d = _vint(head, m + c)
+                        val = head[m + c + d:m + c + d + xsz]
+                        if xid == 0x53AB:
+                            target = int.from_bytes(val, "big")
+                        elif xid == 0x53AC:
+                            pos = int.from_bytes(val, "big")
+                        m += c + d + xsz
+                    if target == 0x1C53BB6B and pos is not None:      # Cues
+                        off = seg_data + pos
+                        h = _read_at(f, off, 16)
+                        cid2, a2 = _vint(h, 0, True)
+                        csz2, b3 = _vint(h, a2)
+                        if cid2 != 0x1C53BB6B:
+                            return None
+                        return off, min(size, off + a2 + b3 + csz2)
+                    k += a + b2 + esz2
+                return None
+            j = body + csz
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
 # ─── catalog: what the /files/ tree contains ────────────────────────────────
 
 @dataclass
@@ -673,6 +767,7 @@ class CastService:
         self.rclone = RcloneMount(self.cfg)
         self.mount_problem = None
         self._lock = threading.Lock()
+        self._oppo_lock = threading.Lock()   # one cast talks to the OPPO at a time
         self._gen = 0
         self.state = {"stage": "idle"}
 
@@ -707,7 +802,7 @@ class CastService:
 
     def status(self):
         with self._lock:
-            return dict(self.state)
+            return {k: v for k, v in self.state.items() if k != "url"}
 
     # -- casting --
     def cast(self, req):
@@ -717,10 +812,18 @@ class CastService:
         if self.mount_problem:
             raise CastError(self.mount_problem)
         with self._lock:
+            # The same stream twice within seconds (app recreated, double tap) must not
+            # start a second play: a play command reaching the OPPO while it is still
+            # setting up the first one crashed its MP4 handler (PbTask0).
+            st = self.state
+            if (st.get("url") == url and st.get("stage") not in ("error", "ended")
+                    and time.time() - st.get("started", 0) < 60):
+                log.info("duplicate cast request for the cast in progress (id %s) ignored", st.get("id"))
+                return {"ok": True, "id": st.get("id"), "duplicate": True}
             self._gen += 1
             gen = self._gen
             self.state = {"stage": "preparing", "id": gen, "title": req.get("title") or "",
-                          "started": time.time(), "updated": time.time()}
+                          "started": time.time(), "updated": time.time(), "url": url}
         threading.Thread(target=self._run, args=(gen, req), name=f"cast-{gen}", daemon=True).start()
         return {"ok": True, "id": gen}
 
@@ -735,7 +838,14 @@ class CastService:
                 self.prewarm(gen, prep)
                 self._set(gen, stage="ready", note="dry run: files published, OPPO not touched")
                 return
-            self.play(gen, prep, float(req.get("position_ms") or 0) / 1000.0)
+            if not self._oppo_lock.acquire(timeout=180):
+                raise CastError("another cast is still talking to the OPPO")
+            try:
+                if not self._set(gen):
+                    return   # superseded while waiting
+                self.play(gen, prep, float(req.get("position_ms") or 0) / 1000.0)
+            finally:
+                self._oppo_lock.release()
             self.monitor(gen)
         except CastError as e:
             log.warning("cast %d failed: %s", gen, e)
@@ -928,17 +1038,36 @@ class CastService:
         return True
 
     def prewarm(self, gen, prep):
-        """Usenet (nzbdav) and debrid pay a big latency for every region nobody has read
-        yet, and the OPPO's open makes far jumps first (MKV: header, then the Cues near
-        the end; MP4: the moov box, at either end). Read head and tail through our own
-        FUSE mount, in parallel, so rclone's VFS cache already holds them."""
+        """Usenet (nzbdav) and debrid pay seconds for every region nobody has read yet,
+        and the OPPO parses the container index before anything else: MP4 'moov'
+        (anywhere in the file; tens of MB for long 4K titles) or MKV 'Cues' (found via
+        the SeekHead). A slow index read is also what lets the OPPO's MP4 handler crash
+        (subtitle setup races the parse: "Invalid memory reference" in
+        CLpMp4MediaManagerProxy::mrStateMachine, seen with a 7 GB usenet MP4).
+        So read the head and the real index through our FUSE mount, in parallel, into
+        rclone's cache; fall back to the last few MB when no index is found."""
         path = os.path.join(self.cfg.mount, prep["cid"], prep["video"])
         size = prep["size"]
-        head = min(size, int(_env("CAST_PREWARM_HEAD_MB", "8")) << 20)
-        tail = int(_env("CAST_PREWARM_TAIL_MB", "4")) << 20
-        regions = [(0, head)] + ([(max(head, size - tail), size)] if size > head else [])
-        if not os.path.isfile(path) or not head:
+        if not os.path.isfile(path) or not size:
             return
+        head = min(size, int(_env("CAST_PREWARM_HEAD_MB", "8")) << 20)
+        cap = int(_env("CAST_PREWARM_INDEX_MB", "96")) << 20
+        index = None
+        try:
+            with open(path, "rb", buffering=0) as f:
+                if prep["ext"] in ("mp4", "m4v", "mov"):
+                    index = mp4_index_range(f, size)
+                elif prep["ext"] == "mkv":
+                    index = mkv_index_range(f, size)
+        except OSError as e:
+            log.warning("index lookup failed: %s", e)
+        regions = [(0, head)]
+        if index and index[1] > head:
+            start, end = max(index[0], head), min(index[1], index[0] + cap)
+            regions.append((start, end))
+            log.info("%s index at %d-%d (%.1f MB)", prep["ext"], index[0], index[1], (index[1] - index[0]) / 1e6)
+        elif not index and size > head:
+            regions.append((max(head, size - (int(_env("CAST_PREWARM_TAIL_MB", "4")) << 20)), size))
 
         def read(start, end):
             try:
@@ -954,13 +1083,16 @@ class CastService:
                 log.warning("prewarm read %d-%d failed: %s", start, end, e)
 
         t0 = time.time()
-        deadline = t0 + int(_env("CAST_PREWARM_TIMEOUT", "15"))
+        deadline = t0 + int(_env("CAST_PREWARM_TIMEOUT", "45"))
         threads = [threading.Thread(target=read, args=r, daemon=True) for r in regions]
         for t in threads:
             t.start()
         for t in threads:
             t.join(max(0.0, deadline - time.time()))
-        log.info("prewarmed %s (%d region(s)) in %.1fs", prep["video"], len(regions), time.time() - t0)
+        done = not any(t.is_alive() for t in threads)
+        log.info("prewarmed %s: %s in %.1fs%s", prep["video"],
+                 ", ".join(f"{(b - a) / 1e6:.1f} MB@{a}" for a, b in regions), time.time() - t0,
+                 "" if done else " (timed out, continuing)")
 
     def select_external_subtitle(self, prep):
         """The OPPO loads <name>.srt but leaves subtitles Off. Embedded tracks are listed
@@ -1005,16 +1137,16 @@ class CastService:
             return
         if warm.is_alive():
             self._set(gen, stage="buffering")
-            warm.join(int(_env("CAST_PREWARM_TIMEOUT", "15")))
+            warm.join(int(_env("CAST_PREWARM_TIMEOUT", "45")) + 5)
         self._set(gen, stage="starting playback")
         path = f"{prep['cid']}/{prep['video']}"   # relative to /mnt/cifs1 = share root
         ok = self._play_and_wait(gen, path)
         if ok is None:
             return
         if not ok:
-            # Seen with MKVs: the OPPO accepts the file and then never starts parsing it;
-            # a second play of the same file then blocks. Stop it and report, don't retry.
-            oppo_call(x, "sendremotekey", {"key": "STP"}, timeout=5)
+            # The OPPO accepted the file but its playback never started. Seen when its
+            # playback thread crashed (then Stop is refused - the "prohibited" icon - and
+            # only a power cycle recovers), so don't send anything more, just report.
             raise CastError(f"the OPPO accepted {prep['video']} but never started playing it - if it stays stuck, power-cycle the OPPO")
         if position_s > 5:
             X.setplaytime(x, position_s * 10_000_000)

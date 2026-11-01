@@ -39,7 +39,20 @@ public class CastActivity extends Activity {
         for (LinearLayout r : new Remote(this, io, () -> positionS).build()) col.addView(r);
         col.addView(Ui.button(this, "Close", v -> finish()));
         setContentView(Ui.screen(this, col));
-        io.execute(this::startCast);
+        if (state == null) {
+            // only on the first creation: Android recreates the activity on rotation etc.,
+            // and a second POST /cast made the OPPO start the same file twice (crash)
+            io.execute(this::startCast);
+        } else {
+            castId = state.getInt("castId", -1);
+            if (castId >= 0) ui.post(this::poll);
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putInt("castId", castId);
     }
 
     private void show(String s, String d) {

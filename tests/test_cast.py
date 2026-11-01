@@ -108,3 +108,24 @@ def test_catalog_keeps_newest():
     assert c.files("a") is None
     c.publish("b", [Entry("b2.mkv", 2, "video/x-matroska")])  # re-publish moves to newest
     assert c.ids() == ["c", "b"]
+
+
+def _box(t, payload=b"", large=False):
+    if large:
+        return (1).to_bytes(4, "big") + t + (16 + len(payload)).to_bytes(8, "big") + payload
+    return (8 + len(payload)).to_bytes(4, "big") + t + payload
+
+
+def test_mp4_index_range_start_end_and_largesize(tmp_path):
+    import io
+    from lib.cast import mp4_index_range
+    moov = _box(b"moov", b"x" * 100)
+    start = _box(b"ftyp", b"isom") + moov + _box(b"mdat", b"\0" * 1000)
+    f = io.BytesIO(start)
+    a, b = mp4_index_range(f, len(start))
+    assert start[a + 4:a + 8] == b"moov" and b - a == len(moov)
+    end = _box(b"ftyp", b"isom") + _box(b"mdat", b"\0" * 5000, large=True) + moov
+    f = io.BytesIO(end)
+    a, b = mp4_index_range(f, len(end))
+    assert end[a + 4:a + 8] == b"moov" and b == len(end)
+    assert mp4_index_range(io.BytesIO(b"\0" * 64), 64) is None
