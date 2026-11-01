@@ -804,26 +804,50 @@ class CastService:
             raise CastError("OPPO not reachable (powered off without network standby?)")
         X.OppoSignin(x)
 
+    def _mount(self, gen):
+        """Mount the share ROOT on the OPPO (each cast lives in <share>/<id>/).
+
+        The OPPO's first SMB connection to a server is slow: the :436 call answers
+        "failed" or times out while the session is still being set up, and a later
+        attempt then succeeds at once - the "press play twice" every Xnoppo/Emby user
+        knows. So retry instead of failing. Mounting the root (not <id>) means later
+        casts reuse the live session instead of stacking a new mount per cast."""
+        x, c = self.cfg.x, self.cfg
+        xq = dict(x, timeout_oppo_mount=int(_env("CAST_MOUNT_TIMEOUT", "20")))
+        attempts = int(_env("CAST_MOUNT_ATTEMPTS", "5"))
+        last = ""
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                if not self._set(gen, stage=f"mounting (attempt {attempt}/{attempts})"):
+                    return False
+                time.sleep(3)
+            X.LoginSambaWithOutID(x, c.smb_server)
+            if c.smb_user:
+                resp = X.mountSharedFolderID(c.smb_server, c.smb_share, c.smb_user, c.smb_password, xq)
+            else:
+                resp = X.mountSharedFolder(c.smb_server, c.smb_share, "", "", xq, checksmb=False)
+            m = _json(resp)
+            if m.get("success"):
+                log.info("OPPO mounted \\\\%s\\%s (attempt %d)", c.smb_server, c.smb_share, attempt)
+                return True
+            last = m.get("retInfo") or m.get("msg") or str(resp)[:200]
+            log.info("OPPO mount attempt %d/%d failed: %s", attempt, attempts, last)
+        raise CastError(f"OPPO couldn't mount \\\\{c.smb_server}\\{c.smb_share} "
+                        f"after {attempts} attempts: {last}")
+
     def play(self, gen, prep, position_s):
         x, c = self.cfg.x, self.cfg
         self._set(gen, stage="waking OPPO")
         self._oppo_ready()
         X.getglobalinfo(x)
-        folder = f"{c.smb_share}/{prep['cid']}"
-        self._set(gen, stage="mounting", share=f"\\\\{c.smb_server}\\{folder}")
-        X.LoginSambaWithOutID(x, c.smb_server)
-        if c.smb_user:
-            resp = X.mountSharedFolderID(c.smb_server, folder, c.smb_user, c.smb_password, x)
-        else:
-            resp = X.mountSharedFolder(c.smb_server, folder, "", "", x, checksmb=False)
-        m = _json(resp)
-        if not m.get("success"):
-            raise CastError(f"OPPO couldn't mount \\\\{c.smb_server}\\{folder}: "
-                            f"{m.get('retInfo') or m.get('msg') or resp[:200]}")
+        self._set(gen, stage="mounting", share=f"\\\\{c.smb_server}\\{c.smb_share}\\{prep['cid']}")
+        if not self._mount(gen):
+            return
         self._set(gen, stage="starting playback")
-        p = _json(X.playnormalfile(c.smb_server, prep["video"], "0", x))
+        path = f"{prep['cid']}/{prep['video']}"   # relative to /mnt/cifs1 = share root
+        p = _json(X.playnormalfile(c.smb_server, path, "0", x))
         if not p.get("success"):
-            raise CastError(f"OPPO refused to play {prep['video']}: {p.get('msg') or p}")
+            raise CastError(f"OPPO refused to play {path}: {p.get('msg') or p}")
         deadline = time.time() + x.get("timeout_oppo_playitem", 60)
         while '"is_video_playing":true' not in X.getglobalinfo(x):
             if time.time() > deadline:

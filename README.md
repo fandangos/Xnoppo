@@ -129,11 +129,13 @@ Set `CAST_TOKEN` to require an `X-Xnoppo-Token` header (or `?token=`).
    ```
    [xnoppo_cast]
      path = /mnt/disks/xnoppo_cast/media
-     browseable = no
+     browseable = yes
      read only = yes
      valid users = YOUR_SMB_USER
    ```
-5. Set `CAST_SMB_SERVER` to the Unraid IP. Check `http://UNRAID:8089/health`.
+5. Set `CAST_SMB_SERVER` to the Unraid **NetBIOS name** (e.g. `TOWER`), not its IP: the OPPO's SMB
+   login resolves servers through NetBIOS browsing, the same way Emby UNC paths (`\\TOWER\...`) reach it.
+   The share must be browseable for the same reason. Check `http://UNRAID:8089/health`.
 
 Test without the app (`dry_run` stops before the OPPO; drop it to really play):
 
