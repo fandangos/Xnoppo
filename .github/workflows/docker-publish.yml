@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, cast]  # cast = test channel -> fandangos/xnoppo:cast
     tags: ['v*']
+    paths-ignore:           # the image only contains lib/, main.py, entrypoint.sh
+      - 'android/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '**.md'
   release:
     types: [published]
 
