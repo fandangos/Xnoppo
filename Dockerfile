@@ -1,4 +1,14 @@
+# rclone is a static Go binary; take it from the official image (pinned).
+FROM rclone/rclone:1.75.1 AS rclone
+
 FROM python:3.11-slim
+
+# fuse3 = fusermount3, which rclone mount needs (casting; see lib/cast.py)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fuse3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/fusermount3 /usr/bin/fusermount
+COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
 WORKDIR /app
 
@@ -32,6 +42,22 @@ ENV EMBY_SERVER="" \
     OPPO_TIMEOUT_MOUNT="60" \
     OPPO_TIMEOUT_PLAY="60" \
     SMBTRICK="false" \
-    AUTOSCRIPT="false"
+    AUTOSCRIPT="false" \
+    CAST_ENABLE="true" \
+    CAST_PORT="8089" \
+    CAST_SMB_SERVER="" \
+    CAST_SMB_SHARE="xnoppo_cast" \
+    CAST_SUB_LANGS="" \
+    CAST_CACHE_MAX="150G" \
+    CAST_CACHE_AGE="6h" \
+    CAST_TOKEN="" \
+    PYTHONUNBUFFERED="1"
+
+# Casting needs (Unraid "Extra Parameters"):
+#   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+# and two paths:
+#   /cast  -> host folder that Unraid's Samba shares as CAST_SMB_SHARE (access mode RW/Shared)
+#   /cache -> rclone's disk cache on the cache pool (sized for remuxes, see CAST_CACHE_MAX)
+EXPOSE 8089
 
 ENTRYPOINT ["/app/entrypoint.sh"]

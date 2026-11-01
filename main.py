@@ -5,11 +5,13 @@ import json
 import threading
 import logging
 import logging.handlers
+import signal
 
 # Add current directory to path for lib imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.Emby_ws import xnoppo_ws
+from lib.cast import CastService, setup_console_logging
 
 
 def main():
@@ -75,12 +77,32 @@ def main():
     ws_thread.start()
     logging.info('Xnoppo container started - waiting for Emby play events')
 
+    # Cast-to-OPPO service (HTTP API + rclone-backed SMB folder), see lib/cast.py.
+    # Optional: a missing /dev/fuse or rclone only disables casting, never Emby.
+    cast = None
+    if os.environ.get("CAST_ENABLE", "true").strip().lower() in ("1", "true", "yes", "on"):
+        setup_console_logging()
+        try:
+            cast = CastService(config)
+            cast.start()
+        except Exception:
+            logging.getLogger("xnoppo.cast").exception("cast service failed to start")
+            cast = None
+
+    # PID 1 in a container ignores SIGTERM unless it has a handler; without one
+    # `docker stop` ends in SIGKILL and leaves a dead FUSE mount on the host.
+    def _terminate(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _terminate)
+
     # Keep alive
     try:
         while True:
             time.sleep(1)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         logging.info('Shutting down')
+        if cast:
+            cast.stop()
         emby_wsocket.stop()
         sys.exit(0)
 

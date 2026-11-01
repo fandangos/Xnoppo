@@ -2,7 +2,7 @@ name: Docker Publish
 
 on:
   push:
-    branches: [main]
+    branches: [main, cast]  # cast = test channel -> fandangos/xnoppo:cast
     tags: ['v*']
   release:
     types: [published]
