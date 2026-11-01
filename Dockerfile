@@ -56,7 +56,8 @@ ENV EMBY_SERVER="" \
 # Casting needs (Unraid "Extra Parameters"):
 #   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
 # and two paths:
-#   /cast  -> host folder that Unraid's Samba shares as CAST_SMB_SHARE (access mode RW/Shared)
+#   /cast  -> host folder, access mode RW/Shared; rclone mounts at /cast/media and Unraid's
+#             Samba shares <host folder>/media as CAST_SMB_SHARE
 #   /cache -> rclone's disk cache on the cache pool (sized for remuxes, see CAST_CACHE_MAX)
 EXPOSE 8089
 

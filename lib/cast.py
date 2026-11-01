@@ -115,7 +115,10 @@ class CastConfig:
         self.smb_share = _env("CAST_SMB_SHARE", "xnoppo_cast").strip("/\\")
         self.smb_user = _env("CAST_SMB_USER") or xconfig.get("smb_user", "")
         self.smb_password = _env("CAST_SMB_PASSWORD") or xconfig.get("smb_password", "")
-        self.mount = _env("CAST_MOUNT", "/cast")
+        # rclone mounts in a SUBFOLDER of the /cast volume: if the container is killed,
+        # the dead FUSE mount left on the host sits below the bind source instead of on
+        # it, so Docker can still start the container and _unmount_stale() clears it.
+        self.mount = _env("CAST_MOUNT", "/cast/media")
         self.manage_rclone = _env_bool("CAST_RCLONE", True)
         self.cache_dir = _env("CAST_CACHE_DIR", "/cache")
         self.cache_max = _env("CAST_CACHE_MAX", "150G")
@@ -556,6 +559,9 @@ class RcloneMount:
         cmd = ["rclone", "mount", ":http:", c.mount,
                "--http-url", f"http://127.0.0.1:{c.files_port}/files/",
                "--read-only",
+               # only matters if CAST_MOUNT is set to the bind mount itself (stacking on it);
+               # safe because a dead rclone mount is removed first (_unmount_stale)
+               "--allow-non-empty",
                "--dir-cache-time", "5s", "--attr-timeout", "5s",
                "--vfs-cache-mode", "full", "--cache-dir", c.cache_dir,
                "--vfs-cache-max-size", c.cache_max, "--vfs-cache-max-age", c.cache_age,
@@ -568,7 +574,29 @@ class RcloneMount:
             cmd += ["--allow-other", "--uid", c.uid, "--gid", c.gid]
         return cmd + c.rclone_extra
 
+    def _top_fstype(self):
+        """fstype of the top-most mount sitting exactly on CAST_MOUNT ('' if none)."""
+        target = os.path.normpath(os.path.abspath(self.cfg.mount))  # no stat: may be a dead mount
+        fstype = ""
+        try:
+            with open("/proc/self/mountinfo") as f:
+                for line in f:
+                    left, _, right = line.partition(" - ")
+                    fields = left.split()
+                    # mountinfo escapes spaces etc. as octal (\040)
+                    mnt = fields[4].encode().decode("unicode_escape") if len(fields) > 4 else ""
+                    if mnt == target:
+                        fstype = right.split()[0] if right else ""  # later lines stack on top
+        except OSError:
+            pass
+        return fstype
+
     def _unmount_stale(self):
+        # Only ever remove OUR FUSE mount (a dead rclone left by a crash). As root,
+        # fusermount -u unmounts anything - including the host bind mount that
+        # /cast IS on Unraid, which silently cut the mount off from the host's Samba.
+        if not self._top_fstype().startswith("fuse"):
+            return
         for tool in ("fusermount3", "fusermount"):
             if shutil.which(tool):
                 subprocess.run([tool, "-uz", self.cfg.mount], capture_output=True)
@@ -581,8 +609,13 @@ class RcloneMount:
     def run(self):
         while not self.stopping:
             self._unmount_stale()
-            os.makedirs(self.cfg.mount, exist_ok=True)
-            os.makedirs(self.cfg.cache_dir, exist_ok=True)
+            try:
+                os.makedirs(self.cfg.mount, exist_ok=True)
+                os.makedirs(self.cfg.cache_dir, exist_ok=True)
+            except OSError as e:
+                log.error("can't prepare %s / %s: %s; retrying in 10s", self.cfg.mount, self.cfg.cache_dir, e)
+                time.sleep(10)
+                continue
             log.info("starting rclone mount at %s", self.cfg.mount)
             self.proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             threading.Thread(target=self._pipe, args=(self.proc.stdout,), daemon=True).start()

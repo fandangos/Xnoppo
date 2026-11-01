@@ -116,16 +116,19 @@ Set `CAST_TOKEN` to require an `X-Xnoppo-Token` header (or `?token=`).
 | `CAST_CACHE_MAX` / `CAST_CACHE_AGE` | `150G` / `6h` | rclone disk cache limits. A file being played is never evicted, so a 100 GB remux can exceed the cap while it plays |
 | `CAST_READ_AHEAD` | `512M` | rclone read-ahead into the cache |
 | `CAST_RCLONE_ARGS` | | Extra `rclone mount` flags |
+| `CAST_MOUNT` | `/cast/media` | Where rclone mounts inside the container |
 
 ### Unraid setup for casting
 
 1. Container → **Extra Parameters**: `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined`
-2. Add path **/cast** → e.g. `/mnt/disks/xnoppo_cast`, access mode **RW/Shared** (the mount must propagate to the host)
+2. Add path **/cast** → e.g. `/mnt/disks/xnoppo_cast`, access mode **RW/Shared**. rclone mounts at
+   `/cast/media`, so the host sees it at `/mnt/disks/xnoppo_cast/media` (a subfolder on purpose: after a
+   crash the dead mount sits *below* the bind source, so the container can still start and clears it)
 3. Add path **/cache** → a folder on the cache pool, e.g. `/mnt/cache/appdata/xnoppo/cache`
 4. Share the host folder over SMB (Settings → SMB → SMB Extras, i.e. `/boot/config/smb-extra.conf`):
    ```
    [xnoppo_cast]
-     path = /mnt/disks/xnoppo_cast
+     path = /mnt/disks/xnoppo_cast/media
      browseable = no
      read only = yes
      valid users = YOUR_SMB_USER
