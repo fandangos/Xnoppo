@@ -39,6 +39,14 @@ final class CastRequest {
         return u != null && u.getLastPathSegment() != null ? u.getLastPathSegment() : "Video";
     }
 
+    /** Where the caller wants playback to start, in ms (0 = from the start). */
+    static long positionMs(Intent in) {
+        Bundle ex = in.getExtras() != null ? in.getExtras() : new Bundle();
+        long pos = number(ex.get("position"));
+        if (pos <= 0) pos = number(ex.get("extra_position"));
+        return Math.max(0, pos);
+    }
+
     /** Builds the request. Does network/content I/O for local subtitles: call off the main thread. */
     static JSONObject build(Context ctx, Intent in) throws JSONException, IOException {
         Uri data = in.getData();

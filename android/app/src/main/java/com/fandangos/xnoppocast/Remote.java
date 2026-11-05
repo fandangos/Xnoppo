@@ -12,7 +12,10 @@ import org.json.JSONObject;
 
 import java.util.concurrent.ExecutorService;
 
-/** Remote-control buttons shared by both screens. Track buttons cycle the OPPO's own menus. */
+/**
+ * Remote-control buttons shared by both screens. They talk to the OPPO directly (its :436 API),
+ * whatever started the playback. Track buttons cycle the OPPO's own menus.
+ */
 final class Remote {
     interface PositionSource { long seconds(); }
 
@@ -29,57 +32,59 @@ final class Remote {
 
     LinearLayout[] build() {
         LinearLayout r1 = Ui.row(a), r2 = Ui.row(a);
-        Button pause = Ui.button(a, "Pause", v -> send("pause", null));
+        Button pause = Ui.button(a, "Pause", v -> key("PAU"));
         r1.addView(pause);
-        r1.addView(Ui.button(a, "Play", v -> send("play", null)));
+        r1.addView(Ui.button(a, "Play", v -> key("PLA")));
         r1.addView(Ui.button(a, "−30s", v -> seek(-30)));
         r1.addView(Ui.button(a, "+30s", v -> seek(+30)));
-        r1.addView(Ui.button(a, "Stop", v -> send("stop", null)));
-        r2.addView(Ui.button(a, "Subtitles", v -> cycle("subtitle")));
-        r2.addView(Ui.button(a, "Audio", v -> cycle("audio")));
+        r1.addView(Ui.button(a, "Stop", v -> key("STP")));
+        r2.addView(Ui.button(a, "Subtitles", v -> cycle(true)));
+        r2.addView(Ui.button(a, "Audio", v -> cycle(false)));
+        r2.addView(Ui.button(a, "Menu", v -> key("MNU")));
         pause.requestFocus();
         return new LinearLayout[]{r1, r2};
+    }
+
+    private Oppo oppo() {
+        return new Oppo(DirectPlay.Settings.load(a).oppoIp);
     }
 
     private void toast(String s) {
         ui.post(() -> Toast.makeText(a, s, Toast.LENGTH_SHORT).show());
     }
 
-    private void send(String action, JSONObject extra) {
+    private void key(String code) {
         io.execute(() -> {
-            try {
-                JSONObject body = extra != null ? extra : new JSONObject();
-                body.put("action", action);
-                new Api(a).post("/control", body);
-            } catch (Exception e) {
-                toast(action + " failed: " + e.getMessage());
-            }
+            Oppo o = oppo();
+            if (!o.portOpen(Oppo.PORT, 1000)) o.wake();
+            JSONObject r = o.key(code);
+            if (!r.optBoolean("success", true)) toast(code + " failed: " + r.optString("retInfo"));
         });
     }
 
     private void seek(int delta) {
         long now = pos.seconds();
         if (now < 0) { toast("position unknown yet"); return; }
-        try {
-            send("seek", new JSONObject().put("position", Math.max(0, now + delta)));
-        } catch (Exception ignored) { }
+        io.execute(() -> oppo().setPlayTime(Math.max(0, now + delta)));
     }
 
-    /** "subtitle" | "audio": read the OPPO's track list, select the next entry. */
-    private void cycle(String kind) {
+    /** Read the OPPO's subtitle or audio list, select the next entry. */
+    private void cycle(boolean subtitles) {
         io.execute(() -> {
             try {
-                Api api = new Api(a);
-                JSONObject res = api.control("tracks").optJSONObject("result");
-                JSONArray list = res == null ? null : res.optJSONArray(kind.equals("subtitle") ? "subtitles" : "audio");
+                Oppo o = oppo();
+                JSONObject res = o.call(subtitles ? "getsubtitlemenulist" : "getaudiomenulist", null, 5000);
+                JSONArray list = res.optJSONArray(subtitles ? "subtitle_list" : "audio_list");
+                String kind = subtitles ? "subtitle" : "audio";
                 if (list == null || list.length() == 0) { toast("no " + kind + " tracks"); return; }
                 int cur = 0;
                 for (int i = 0; i < list.length(); i++) if (list.getJSONObject(i).optBoolean("selected")) cur = i;
                 JSONObject next = list.getJSONObject((cur + 1) % list.length());
-                api.post("/control", new JSONObject().put("action", kind).put("index", next.getInt("index")));
-                toast(next.optString("name", "track " + next.getInt("index")).trim());
+                o.call(subtitles ? "setsubttmenulist" : "setaudiomenulist",
+                        Oppo.obj("cur_index", next.getInt("index")), 5000);
+                toast(next.optString("name", kind + " " + next.getInt("index")).trim());
             } catch (Exception e) {
-                toast(kind + " failed: " + e.getMessage());
+                toast("failed: " + e.getMessage());
             }
         });
     }

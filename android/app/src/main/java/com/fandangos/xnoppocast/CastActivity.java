@@ -2,6 +2,7 @@ package com.fandangos.xnoppocast;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -14,17 +15,24 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * "Play on OPPO": receives the stream from Nuvio/Stremio, hands it to Xnoppo, shows progress and
- * a small remote, and returns the playback position to the caller (MX Player result convention:
- * position/duration in ms + end_by) so the app keeps tracking watch progress.
+ * "Play on OPPO": what Nuvio/Stremio open as an external player.
+ *
+ * AIOStreams/AltMount releases (the usual case) play directly: the app resolves the link and
+ * has the OPPO mount the server's share and play the file (DirectPlay); nothing else is
+ * involved. Any other stream is handed to Xnoppo's cast service, if an Xnoppo address is set.
+ *
+ * Shows progress and a small remote, and returns the playback position to the caller (MX Player
+ * result convention: position/duration in ms + end_by) so the app keeps tracking watch progress.
  */
 public class CastActivity extends Activity {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService watch = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView stage, detail;
     private volatile int castId = -1;
     private volatile long positionS = -1, durationS = -1;
-    private volatile boolean ended, stopped;
+    private volatile boolean ended, stopped, direct;
+    private volatile DirectPlay play;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -32,20 +40,26 @@ public class CastActivity extends Activity {
         LinearLayout col = Ui.column(this);
         col.addView(Ui.text(this, "Play on OPPO", 14, false));
         col.addView(Ui.text(this, CastRequest.title(getIntent()), 24, true));
-        stage = Ui.text(this, "Sending to Xnoppo…", 20, true);
+        stage = Ui.text(this, "Starting…", 20, true);
         detail = Ui.text(this, "", 16, false);
         col.addView(stage);
         col.addView(detail);
         for (LinearLayout r : new Remote(this, io, () -> positionS).build()) col.addView(r);
         col.addView(Ui.button(this, "Close", v -> finish()));
         setContentView(Ui.screen(this, col));
+
+        Uri data = getIntent().getData();
+        String url = data == null ? "" : data.toString();
+        direct = AltMount.isLink(url);
         if (state == null) {
             // only on the first creation: Android recreates the activity on rotation etc.,
-            // and a second POST /cast made the OPPO start the same file twice (crash)
-            io.execute(this::startCast);
+            // and a second play request made the OPPO start the same file twice (crash)
+            if (direct) watch.execute(() -> startDirect(url));
+            else io.execute(this::startXnoppo);
         } else {
             castId = state.getInt("castId", -1);
-            if (castId >= 0) ui.post(this::poll);
+            if (direct) watch.execute(this::watchOppo);
+            else if (castId >= 0) ui.post(this::poll);
         }
     }
 
@@ -62,7 +76,55 @@ public class CastActivity extends Activity {
         });
     }
 
-    private void startCast() {
+    // -- direct: AIOStreams/AltMount release from the server's share ---------------------
+
+    private void startDirect(String url) {
+        DirectPlay.Settings s = DirectPlay.Settings.load(this);
+        play = new DirectPlay(s, this::show);
+        try {
+            play.play(url, CastRequest.positionMs(getIntent()) / 1000);
+            AltMount.Target t = play.target;
+            show(t.isDisc() ? "Playing on OPPO (disc menu)" : "Playing on OPPO", t.name());
+            watchOppo();
+        } catch (Exception e) {
+            if (!stopped) show("Couldn't play", String.valueOf(e.getMessage()));
+        }
+    }
+
+    /** Follow the OPPO's position until playback ends (3 checks in a row without video). */
+    private void watchOppo() {
+        Oppo o = new Oppo(DirectPlay.Settings.load(this).oppoIp);
+        String name = play != null && play.target != null ? play.target.name() : "";
+        int misses = 0;
+        while (!stopped) {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                return;
+            }
+            if (o.globalInfo().optBoolean("is_video_playing")) {
+                misses = 0;
+                JSONObject t = o.call("getplayingtime", null, 5000);
+                if (t.has("cur_time")) positionS = t.optLong("cur_time", positionS);
+                if (t.has("total_time")) durationS = t.optLong("total_time", durationS);
+                show("Playing on OPPO", Ui.clock(positionS) + " / " + Ui.clock(durationS) + "\n" + name);
+            } else if (++misses >= 3 && positionS >= 0) {
+                ended = true;
+                show("Finished", Ui.clock(positionS) + " / " + Ui.clock(durationS));
+                ui.post(this::finish);
+                return;
+            }
+        }
+    }
+
+    // -- anything else: Xnoppo's cast service, when configured --------------------------
+
+    private void startXnoppo() {
+        if (Api.prefs(this).getString("server", "").trim().isEmpty()) {
+            show("Can't play this stream", "Only AIOStreams Usenet releases (AltMount) play directly on the OPPO. "
+                    + "Set an Xnoppo address in the Xnoppo Cast app to cast other streams through Xnoppo.");
+            return;
+        }
         try {
             JSONObject req = CastRequest.build(this, getIntent());
             int subs = req.has("subtitles") ? req.getJSONArray("subtitles").length() : 0;
@@ -128,7 +190,10 @@ public class CastActivity extends Activity {
     @Override
     protected void onDestroy() {
         stopped = true;
+        DirectPlay p = play;
+        if (p != null) p.cancelled = true;
         io.shutdownNow();
+        watch.shutdownNow();
         super.onDestroy();
     }
 }
